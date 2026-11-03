@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Ambientes virtuais
+.venv/
+env/
+venv/
+ENV/
+
+# Testes e cobertura
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Banco de dados SQLite e dados locais
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+data/
+uploads/
+
+# Arquivos de ambiente e segredos
+.env
+.env.local
+.env.*.local
+
+# IDEs e editores
+.vscode/
+.idea/
+*.swp
+*.swo
