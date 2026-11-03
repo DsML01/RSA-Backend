@@ -34,9 +34,13 @@ app = FastAPI(
     description="Autenticação e envio individual de arquivos RSA em ZIP.",
     lifespan=lifespan,
 )
+cors_origins_list = [origin.strip().rstrip("/") for origin in settings.cors_origins.split(",") if origin.strip()]
+if "*" in cors_origins_list:
+    cors_origins_list = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in settings.cors_origins.split(",")],
+    allow_origins=cors_origins_list,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
