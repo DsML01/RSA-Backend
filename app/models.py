@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
@@ -42,15 +42,18 @@ class StudentGroupMembership(Base):
 
 
 class RsaUpload(Base):
-    """Arquivo ZIP enviado por um aluno, sem vínculo com atividade ou grupo."""
+    """Arquivo ZIP enviado por um aluno, com vínculo opcional ao grupo no momento do envio."""
 
     __tablename__ = "rsa_uploads"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    group_id: Mapped[int | None] = mapped_column(ForeignKey("rsa_student_groups.id"), nullable=True, index=True)
     original_filename: Mapped[str] = mapped_column(String(255))
     stored_path: Mapped[str] = mapped_column(String(512))
     sha256: Mapped[str] = mapped_column(String(64))
+    has_encoder: Mapped[bool] = mapped_column(Boolean, default=True)
+    has_decoder: Mapped[bool] = mapped_column(Boolean, default=True)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -61,6 +64,7 @@ class RsaTestRun(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     upload_id: Mapped[int] = mapped_column(ForeignKey("rsa_uploads.id"), index=True)
+    mode: Mapped[str] = mapped_column(String(20), default="both")
     status: Mapped[str] = mapped_column(String(20), default="queued")
     total: Mapped[int] = mapped_column(Integer, default=240)
     approved: Mapped[int] = mapped_column(Integer, default=0)

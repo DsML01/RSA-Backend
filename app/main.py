@@ -7,31 +7,52 @@ import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import desc, func, select
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from .auth import create_access_token, get_current_user, hash_password, verify_password
 from .config import settings
-from .database import Base, SessionLocal, engine, get_db
+from .database import Base, SessionLocal, engine, ensure_schema_columns, get_db
 from .models import GroupRsaTestRun, RsaTestRun, RsaUpload, StudentGroup, StudentGroupMembership, User
-from .schemas import CustomRsaTestIn, GrantRoleIn, GroupCreateIn, GroupCustomRsaTestIn, GroupMemberIn, GroupRsaTestIn, LoginIn, RegisterIn
-from .testing import GROUP_TOTAL_TESTS, TOTAL_TESTS, TestExecutionError, run_custom_test, run_group_custom_test, run_group_test_battery, run_test_battery
+from .schemas import (
+    CustomRsaTestIn,
+    GrantRoleIn,
+    GroupCreateIn,
+    GroupCustomRsaTestIn,
+    GroupMemberIn,
+    GroupRsaTestIn,
+    LoginIn,
+    RegisterIn,
+    RsaTestIn,
+)
+from .testing import (
+    GROUP_TOTAL_TESTS,
+    TOTAL_TESTS,
+    TestExecutionError,
+    resolve_test_mode,
+    run_custom_test,
+    run_group_custom_test,
+    run_group_test_battery,
+    run_test_battery,
+)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(bind=engine)
+    ensure_schema_columns(engine)
     yield
 
 
 app = FastAPI(
     title="RSA Project API",
-    version="0.3.0",
-    description="Autenticação e envio individual de arquivos RSA em ZIP.",
+    version="0.4.0",
+    description="Autenticação, grupos, histórico de envios e testes RSA individuais (com oráculo) ou entre grupos.",
     lifespan=lifespan,
 )
 cors_origins_list = [origin.strip().rstrip("/") for origin in settings.cors_origins.split(",") if origin.strip()]
@@ -47,6 +68,10 @@ app.add_middleware(
 )
 
 
+def user_payload(user: User) -> dict:
+    return {"id": user.id, "name": user.name, "email": user.email, "role": user.role}
+
+
 def test_payload(test_run: RsaTestRun) -> dict:
     try:
         summary = json.loads(test_run.summary)
@@ -54,6 +79,7 @@ def test_payload(test_run: RsaTestRun) -> dict:
         summary = {}
     return {
         "id": test_run.id,
+        "mode": getattr(test_run, "mode", None) or summary.get("mode", "both"),
         "status": test_run.status,
         "total": test_run.total,
         "approved": test_run.approved,
@@ -62,31 +88,70 @@ def test_payload(test_run: RsaTestRun) -> dict:
         "score_percent": round((test_run.approved / test_run.total * 100) if test_run.total else 0, 2),
         "buckets": summary.get("buckets", {}),
         "last_error": summary.get("last_error", ""),
+        "created_at": test_run.created_at,
+        "completed_at": test_run.completed_at,
     }
 
 
 def upload_payload(db: Session, upload: RsaUpload) -> dict:
-    latest_test = db.scalar(
+    runs = db.scalars(
         select(RsaTestRun).where(RsaTestRun.upload_id == upload.id).order_by(desc(RsaTestRun.id))
-    )
+    ).all()
+    submitter = db.get(User, upload.user_id)
     payload = {
         "id": upload.id,
         "filename": upload.original_filename,
+        "sha256": upload.sha256,
+        "group_id": upload.group_id,
+        "has_encoder": bool(upload.has_encoder),
+        "has_decoder": bool(upload.has_decoder),
         "uploaded_at": upload.uploaded_at,
+        "submitted_by": user_payload(submitter) if submitter else None,
+        "test_runs": [test_payload(run) for run in runs],
     }
-    if latest_test:
-        payload["latest_test"] = test_payload(latest_test)
+    if runs:
+        payload["latest_test"] = payload["test_runs"][0]
     return payload
 
 
-def latest_upload_for_group(db: Session, group_id: int) -> RsaUpload | None:
-    """Return the newest submission made by any member of a group."""
-    return db.scalar(
-        select(RsaUpload)
-        .join(StudentGroupMembership, StudentGroupMembership.user_id == RsaUpload.user_id)
-        .where(StudentGroupMembership.group_id == group_id)
-        .order_by(desc(RsaUpload.uploaded_at), desc(RsaUpload.id))
+def _group_uploads_condition(group_id: int):
+    member_ids = select(StudentGroupMembership.user_id).where(StudentGroupMembership.group_id == group_id)
+    return or_(
+        RsaUpload.group_id == group_id,
+        and_(RsaUpload.group_id.is_(None), RsaUpload.user_id.in_(member_ids)),
     )
+
+
+def list_uploads_for_group(db: Session, group_id: int) -> list[RsaUpload]:
+    """Return all submissions belonging to a group, newest first."""
+    return list(
+        db.scalars(
+            select(RsaUpload)
+            .where(_group_uploads_condition(group_id))
+            .order_by(desc(RsaUpload.uploaded_at), desc(RsaUpload.id))
+        ).all()
+    )
+
+
+def upload_belongs_to_group(db: Session, upload: RsaUpload, group_id: int) -> bool:
+    if upload.group_id is not None:
+        return upload.group_id == group_id
+    membership = db.scalar(select(StudentGroupMembership).where(StudentGroupMembership.user_id == upload.user_id))
+    return bool(membership and membership.group_id == group_id)
+
+
+def latest_upload_for_group(
+    db: Session,
+    group_id: int,
+    required_component: Literal["encoder", "decoder"] | None = None,
+) -> RsaUpload | None:
+    """Return the newest submission made by a group (optionally filtering by encoder.c or decoder.c)."""
+    stmt = select(RsaUpload).where(_group_uploads_condition(group_id))
+    if required_component == "encoder":
+        stmt = stmt.where(RsaUpload.has_encoder.is_(True))
+    elif required_component == "decoder":
+        stmt = stmt.where(RsaUpload.has_decoder.is_(True))
+    return db.scalar(stmt.order_by(desc(RsaUpload.uploaded_at), desc(RsaUpload.id)))
 
 
 def group_test_payload(db: Session, test_run: GroupRsaTestRun) -> dict:
@@ -98,6 +163,8 @@ def group_test_payload(db: Session, test_run: GroupRsaTestRun) -> dict:
     decoder_group = db.get(StudentGroup, test_run.decoder_group_id)
     encoder_upload = db.get(RsaUpload, test_run.encoder_upload_id)
     decoder_upload = db.get(RsaUpload, test_run.decoder_upload_id)
+    encoder_submitter = db.get(User, encoder_upload.user_id) if encoder_upload else None
+    decoder_submitter = db.get(User, decoder_upload.user_id) if decoder_upload else None
     return {
         "id": test_run.id,
         "status": test_run.status,
@@ -107,17 +174,20 @@ def group_test_payload(db: Session, test_run: GroupRsaTestRun) -> dict:
         "errored": test_run.errored,
         "score_percent": round((test_run.approved / test_run.total * 100) if test_run.total else 0, 2),
         "last_error": summary.get("last_error", ""),
+        "faulty_side": summary.get("faulty_side", "none"),
+        "encoder_stats": summary.get("encoder_stats"),
+        "decoder_stats": summary.get("decoder_stats"),
         "created_at": test_run.created_at,
         "completed_at": test_run.completed_at,
         "encoder_group": {"id": encoder_group.id, "name": encoder_group.name} if encoder_group else None,
         "decoder_group": {"id": decoder_group.id, "name": decoder_group.name} if decoder_group else None,
+        "encoder_upload_id": test_run.encoder_upload_id,
+        "decoder_upload_id": test_run.decoder_upload_id,
         "encoder_upload": encoder_upload.original_filename if encoder_upload else None,
         "decoder_upload": decoder_upload.original_filename if decoder_upload else None,
+        "encoder_submitter": user_payload(encoder_submitter) if encoder_submitter else None,
+        "decoder_submitter": user_payload(decoder_submitter) if decoder_submitter else None,
     }
-
-
-def user_payload(user: User) -> dict:
-    return {"id": user.id, "name": user.name, "email": user.email, "role": user.role}
 
 
 def group_payload(db: Session, group: StudentGroup) -> dict:
@@ -128,12 +198,18 @@ def group_payload(db: Session, group: StudentGroup) -> dict:
         .where(StudentGroupMembership.group_id == group.id)
         .order_by(User.name)
     ).all()
+    upload_count = db.scalar(
+        select(func.count()).select_from(RsaUpload).where(_group_uploads_condition(group.id))
+    ) or 0
+    latest_upload = latest_upload_for_group(db, group.id)
     return {
         "id": group.id,
         "name": group.name,
         "created_at": group.created_at,
         "leader": user_payload(leader) if leader else None,
         "members": [user_payload(member) for member in members],
+        "upload_count": upload_count,
+        "latest_upload": upload_payload(db, latest_upload) if latest_upload else None,
     }
 
 
@@ -156,28 +232,31 @@ def execute_test_run(test_run_id: int) -> None:
         upload = db.get(RsaUpload, test_run.upload_id)
         if not upload:
             test_run.status = "error"
-            test_run.summary = json.dumps({"last_error": "Arquivo enviado não encontrado."})
+            test_run.summary = json.dumps({"mode": test_run.mode, "last_error": "Arquivo enviado não encontrado."})
             test_run.completed_at = datetime.utcnow()
             db.commit()
             return
         test_run.status = "running"
         db.commit()
         try:
-            result = run_test_battery(Path(upload.stored_path))
+            result = run_test_battery(Path(upload.stored_path), mode=test_run.mode or "auto")
+            test_run.mode = result["mode"]
             test_run.total = result["total"]
             test_run.approved = result["approved"]
             test_run.failed = result["failed"]
             test_run.errored = result["errored"]
-            test_run.summary = json.dumps({"buckets": result["buckets"], "last_error": result["last_error"]})
+            test_run.summary = json.dumps(
+                {"mode": result["mode"], "buckets": result["buckets"], "last_error": result["last_error"]}
+            )
             test_run.status = "passed" if test_run.approved == test_run.total else "failed"
         except TestExecutionError as exc:
             test_run.status = "error"
             test_run.errored = TOTAL_TESTS
-            test_run.summary = json.dumps({"last_error": str(exc)})
+            test_run.summary = json.dumps({"mode": test_run.mode, "last_error": str(exc)})
         except Exception:
             test_run.status = "error"
             test_run.errored = TOTAL_TESTS
-            test_run.summary = json.dumps({"last_error": "Falha inesperada durante os testes."})
+            test_run.summary = json.dumps({"mode": test_run.mode, "last_error": "Falha inesperada durante os testes."})
         test_run.completed_at = datetime.utcnow()
         db.commit()
 
@@ -193,7 +272,7 @@ def execute_group_test_run(test_run_id: int) -> None:
         if not encoder_upload or not decoder_upload:
             test_run.status = "error"
             test_run.errored = GROUP_TOTAL_TESTS
-            test_run.summary = json.dumps({"last_error": "Arquivo enviado não encontrado."})
+            test_run.summary = json.dumps({"faulty_side": "both", "last_error": "Arquivo enviado não encontrado."})
             test_run.completed_at = datetime.utcnow()
             db.commit()
             return
@@ -205,27 +284,37 @@ def execute_group_test_run(test_run_id: int) -> None:
             test_run.approved = result["approved"]
             test_run.failed = result["failed"]
             test_run.errored = result["errored"]
-            test_run.summary = json.dumps({"last_error": result["last_error"]})
+            test_run.summary = json.dumps(
+                {
+                    "last_error": result["last_error"],
+                    "faulty_side": result["faulty_side"],
+                    "encoder_stats": result["encoder_stats"],
+                    "decoder_stats": result["decoder_stats"],
+                }
+            )
             test_run.status = "passed" if test_run.approved == test_run.total else "failed"
         except TestExecutionError as exc:
             test_run.status = "error"
             test_run.errored = GROUP_TOTAL_TESTS
-            test_run.summary = json.dumps({"last_error": str(exc)})
+            test_run.summary = json.dumps({"faulty_side": "both", "last_error": str(exc)})
         except Exception:
             test_run.status = "error"
             test_run.errored = GROUP_TOTAL_TESTS
-            test_run.summary = json.dumps({"last_error": "Falha inesperada durante os testes entre grupos."})
+            test_run.summary = json.dumps(
+                {"faulty_side": "both", "last_error": "Falha inesperada durante os testes entre grupos."}
+            )
         test_run.completed_at = datetime.utcnow()
         db.commit()
 
 
-def validate_rsa_zip(content: bytes) -> None:
+def validate_rsa_zip(content: bytes) -> dict[str, bool]:
     if len(content) > settings.max_zip_bytes:
         raise HTTPException(status_code=413, detail="O ZIP ultrapassa o limite de 1 MB.")
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
             extracted_size = 0
-            c_files = 0
+            encoder_count = 0
+            decoder_count = 0
             for info in archive.infolist():
                 path = Path(info.filename)
                 mode = info.external_attr >> 16
@@ -236,10 +325,19 @@ def validate_rsa_zip(content: bytes) -> None:
                 extracted_size += info.file_size
                 if extracted_size > settings.max_unzipped_bytes:
                     raise HTTPException(status_code=422, detail="O conteúdo descompactado excede 5 MB.")
-                if path.suffix.lower() == ".c":
-                    c_files += 1
-            if c_files == 0:
-                raise HTTPException(status_code=422, detail="O ZIP deve conter ao menos um arquivo .c.")
+                if path.name == "encoder.c":
+                    encoder_count += 1
+                elif path.name == "decoder.c":
+                    decoder_count += 1
+            if encoder_count > 1 or decoder_count > 1:
+                raise HTTPException(
+                    status_code=422, detail="O ZIP não pode conter arquivos encoder.c ou decoder.c duplicados."
+                )
+            if encoder_count == 0 and decoder_count == 0:
+                raise HTTPException(
+                    status_code=422, detail="O ZIP deve conter encoder.c, decoder.c ou ambos."
+                )
+            return {"has_encoder": encoder_count == 1, "has_decoder": decoder_count == 1}
     except zipfile.BadZipFile as exc:
         raise HTTPException(status_code=422, detail="Envie um arquivo ZIP válido.") from exc
 
@@ -313,6 +411,29 @@ def list_groups_for_teacher(
     require_teacher_role(user)
     groups = db.scalars(select(StudentGroup).order_by(StudentGroup.name)).all()
     return [group_payload(db, group) for group in groups]
+
+
+@app.get("/api/v1/groups/{group_id}/uploads")
+def list_group_uploads(
+    group_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Return the full submission history of a group (for teachers and members of that group)."""
+    group = db.get(StudentGroup, group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail="Grupo não encontrado.")
+    if user.role != "teacher":
+        membership = db.scalar(
+            select(StudentGroupMembership).where(
+                StudentGroupMembership.group_id == group_id,
+                StudentGroupMembership.user_id == user.id,
+            )
+        )
+        if not membership:
+            raise HTTPException(status_code=403, detail="Você não tem permissão para ver os envios deste grupo.")
+    uploads = list_uploads_for_group(db, group_id)
+    return [upload_payload(db, upload) for upload in uploads]
 
 
 @app.post("/api/v1/groups", status_code=status.HTTP_201_CREATED)
@@ -389,19 +510,46 @@ def add_group_member(
     return group_payload(db, group)
 
 
-def group_uploads_for_test(db: Session, encoder_group_id: int, decoder_group_id: int) -> tuple[StudentGroup, StudentGroup, RsaUpload, RsaUpload]:
+def group_uploads_for_test(
+    db: Session,
+    encoder_group_id: int,
+    decoder_group_id: int,
+    encoder_upload_id: int | None = None,
+    decoder_upload_id: int | None = None,
+) -> tuple[StudentGroup, StudentGroup, RsaUpload, RsaUpload]:
     if encoder_group_id == decoder_group_id:
         raise HTTPException(status_code=422, detail="Escolha grupos diferentes para cifrar e decifrar.")
     encoder_group = db.get(StudentGroup, encoder_group_id)
     decoder_group = db.get(StudentGroup, decoder_group_id)
     if not encoder_group or not decoder_group:
         raise HTTPException(status_code=404, detail="Grupo não encontrado.")
-    encoder_upload = latest_upload_for_group(db, encoder_group.id)
-    decoder_upload = latest_upload_for_group(db, decoder_group.id)
+
+    if encoder_upload_id is not None:
+        encoder_upload = db.get(RsaUpload, encoder_upload_id)
+        if not encoder_upload or not upload_belongs_to_group(db, encoder_upload, encoder_group.id):
+            raise HTTPException(status_code=422, detail="O envio selecionado para o encoder não pertence a esse grupo.")
+        if not encoder_upload.has_encoder:
+            raise HTTPException(status_code=422, detail="O envio selecionado para o grupo encoder não contém encoder.c.")
+    else:
+        encoder_upload = latest_upload_for_group(db, encoder_group.id, required_component="encoder")
+
+    if decoder_upload_id is not None:
+        decoder_upload = db.get(RsaUpload, decoder_upload_id)
+        if not decoder_upload or not upload_belongs_to_group(db, decoder_upload, decoder_group.id):
+            raise HTTPException(status_code=422, detail="O envio selecionado para o decoder não pertence a esse grupo.")
+        if not decoder_upload.has_decoder:
+            raise HTTPException(status_code=422, detail="O envio selecionado para o grupo decoder não contém decoder.c.")
+    else:
+        decoder_upload = latest_upload_for_group(db, decoder_group.id, required_component="decoder")
+
     if not encoder_upload:
-        raise HTTPException(status_code=422, detail=f"O grupo {encoder_group.name} ainda não possui um arquivo enviado.")
+        raise HTTPException(
+            status_code=422, detail=f"O grupo {encoder_group.name} ainda não possui um envio com encoder.c."
+        )
     if not decoder_upload:
-        raise HTTPException(status_code=422, detail=f"O grupo {decoder_group.name} ainda não possui um arquivo enviado.")
+        raise HTTPException(
+            status_code=422, detail=f"O grupo {decoder_group.name} ainda não possui um envio com decoder.c."
+        )
     return encoder_group, decoder_group, encoder_upload, decoder_upload
 
 
@@ -410,7 +558,7 @@ def list_group_tests(
     user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> list[dict]:
     require_teacher_role(user)
-    runs = db.scalars(select(GroupRsaTestRun).order_by(desc(GroupRsaTestRun.created_at)).limit(30)).all()
+    runs = db.scalars(select(GroupRsaTestRun).order_by(desc(GroupRsaTestRun.id)).limit(30)).all()
     return [group_test_payload(db, run) for run in runs]
 
 
@@ -421,10 +569,14 @@ def start_group_test(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Queue 50 texts across 2-to-9-digit primes for the latest uploads of two groups."""
+    """Queue 50 texts across 2-to-9-digit primes for the selected/latest uploads of two groups."""
     require_teacher_role(user)
     encoder_group, decoder_group, encoder_upload, decoder_upload = group_uploads_for_test(
-        db, data.encoder_group_id, data.decoder_group_id
+        db,
+        data.encoder_group_id,
+        data.decoder_group_id,
+        data.encoder_upload_id,
+        data.decoder_upload_id,
     )
     active_run = db.scalar(
         select(GroupRsaTestRun).where(
@@ -456,10 +608,14 @@ def custom_group_test(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Run one teacher-selected interoperability case using the newest group uploads."""
+    """Run one teacher-selected interoperability case using the selected/newest group uploads."""
     require_teacher_role(user)
     encoder_group, decoder_group, encoder_upload, decoder_upload = group_uploads_for_test(
-        db, data.encoder_group_id, data.decoder_group_id
+        db,
+        data.encoder_group_id,
+        data.decoder_group_id,
+        data.encoder_upload_id,
+        data.decoder_upload_id,
     )
     try:
         result = run_group_custom_test(
@@ -468,7 +624,22 @@ def custom_group_test(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except TestExecutionError as exc:
-        return {"status": "error", "ciphertext": [], "decrypted_message": None, "decoder_output": "", "decoder_stderr": "", "error": str(exc), "public_key": {"n": data.p * data.q, "e": data.e}}
+        return {
+            "status": "error",
+            "faulty_side": "both",
+            "encoder_status": "error",
+            "decoder_status": "error",
+            "encoder_error": str(exc),
+            "decoder_error": str(exc),
+            "ciphertext": [],
+            "decrypted_message": None,
+            "decoder_output": "",
+            "decoder_stderr": "",
+            "error": str(exc),
+            "public_key": {"n": data.p * data.q, "e": data.e},
+            "encoder_group": {"id": encoder_group.id, "name": encoder_group.name},
+            "decoder_group": {"id": decoder_group.id, "name": decoder_group.name},
+        }
     return {
         **result,
         "public_key": {"n": data.p * data.q, "e": data.e},
@@ -501,7 +672,9 @@ def leave_my_group(user: User = Depends(get_current_user), db: Session = Depends
             select(func.count()).select_from(StudentGroupMembership).where(StudentGroupMembership.group_id == group.id)
         )
         if member_count > 1:
-            raise HTTPException(status_code=409, detail="O líder não pode sair enquanto houver outros integrantes no grupo.")
+            raise HTTPException(
+                status_code=409, detail="O líder não pode sair enquanto houver outros integrantes no grupo."
+            )
         db.delete(membership)
         db.delete(group)
         db.commit()
@@ -517,7 +690,7 @@ def list_my_uploads(user: User = Depends(get_current_user), db: Session = Depend
     if user.role != "student":
         raise HTTPException(status_code=403, detail="Somente alunos possuem envios de RSA nesta etapa.")
     uploads = db.scalars(
-        select(RsaUpload).where(RsaUpload.user_id == user.id).order_by(desc(RsaUpload.uploaded_at))
+        select(RsaUpload).where(RsaUpload.user_id == user.id).order_by(desc(RsaUpload.uploaded_at), desc(RsaUpload.id))
     ).all()
     return [upload_payload(db, upload) for upload in uploads]
 
@@ -534,15 +707,19 @@ async def upload_rsa_file(
         raise HTTPException(status_code=422, detail="Envie um arquivo com extensão .zip.")
 
     content = await file.read(settings.max_zip_bytes + 1)
-    validate_rsa_zip(content)
+    sources = validate_rsa_zip(content)
     storage_path = settings.upload_dir / f"{uuid.uuid4().hex}.zip"
     storage_path.write_bytes(content)
 
+    membership = db.scalar(select(StudentGroupMembership).where(StudentGroupMembership.user_id == user.id))
     upload = RsaUpload(
         user_id=user.id,
+        group_id=membership.group_id if membership else None,
         original_filename=Path(file.filename).name,
         stored_path=str(storage_path),
         sha256=hashlib.sha256(content).hexdigest(),
+        has_encoder=sources["has_encoder"],
+        has_decoder=sources["has_decoder"],
     )
     db.add(upload)
     db.commit()
@@ -554,6 +731,7 @@ async def upload_rsa_file(
 def test_rsa_upload(
     upload_id: int,
     background_tasks: BackgroundTasks,
+    data: RsaTestIn | None = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -571,7 +749,13 @@ def test_rsa_upload(
     if active_run:
         raise HTTPException(status_code=409, detail="Este arquivo já está sendo testado.")
 
-    test_run = RsaTestRun(upload_id=upload.id, status="queued")
+    requested_mode = data.mode if data else "auto"
+    try:
+        resolved_mode = resolve_test_mode(Path(upload.stored_path), requested_mode)
+    except TestExecutionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    test_run = RsaTestRun(upload_id=upload.id, mode=resolved_mode, status="queued")
     db.add(test_run)
     db.commit()
     db.refresh(test_run)
@@ -586,18 +770,19 @@ def custom_test_rsa_upload(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Run one manually configured RSA round trip against the student's ZIP."""
+    """Run one manually configured RSA round trip (complete or partial with oracle) against the student's ZIP."""
     if user.role != "student":
         raise HTTPException(status_code=403, detail="Somente alunos podem testar arquivos RSA nesta etapa.")
     upload = db.get(RsaUpload, upload_id)
     if not upload or upload.user_id != user.id:
         raise HTTPException(status_code=404, detail="Arquivo não encontrado.")
     try:
-        result = run_custom_test(Path(upload.stored_path), data.message, data.p, data.q, data.e)
+        resolved_mode = resolve_test_mode(Path(upload.stored_path), data.mode)
+        result = run_custom_test(Path(upload.stored_path), data.message, data.p, data.q, data.e, mode=resolved_mode)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except TestExecutionError as exc:
-        return {"status": "error", "ciphertext": [], "decrypted_message": None, "decoder_output": "", "decoder_stderr": "", "error": str(exc)}
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return {
         **result,

@@ -1,4 +1,4 @@
-"""Compilação e teste de um ZIP individual com encoder.c e decoder.c."""
+"""Compilação e teste de entregas RSA em C (individuais, com oráculo ou entre grupos)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import resource
 import shutil
 import subprocess
 import tempfile
-import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +16,11 @@ from pathlib import Path
 MAX_LOG_BYTES = 64 * 1024
 TIMEOUT_SECONDS = 3
 MEMORY_BYTES = 128 * 1024 * 1024
+
+ORACLE_DIR = Path(__file__).resolve().parent / "oracle"
+ORACLE_ENCODER_SOURCE = ORACLE_DIR / "encoder.c"
+ORACLE_DECODER_SOURCE = ORACLE_DIR / "decoder.c"
+VALID_TEST_MODES = ("both", "encoder_only", "decoder_only")
 
 
 class TestExecutionError(Exception):
@@ -33,22 +37,51 @@ class TestCase:
     d: int
 
 
-def validate_test_sources(zip_path: Path) -> None:
+def inspect_zip_sources(zip_path: Path) -> dict[str, bool]:
+    """Inspect whether a submission ZIP has unique encoder.c and/or decoder.c files."""
     try:
         with zipfile.ZipFile(zip_path) as archive:
             names = [Path(info.filename).name for info in archive.infolist() if not info.is_dir()]
-            for required in ("encoder.c", "decoder.c"):
-                if names.count(required) != 1:
-                    raise TestExecutionError(
-                        "Para testar, o ZIP deve conter exatamente encoder.c e decoder.c."
-                    )
     except zipfile.BadZipFile as exc:
         raise TestExecutionError("O arquivo enviado não é um ZIP válido.") from exc
 
+    encoder_count = names.count("encoder.c")
+    decoder_count = names.count("decoder.c")
+    if encoder_count > 1 or decoder_count > 1:
+        raise TestExecutionError("O ZIP não pode conter arquivos encoder.c ou decoder.c duplicados.")
+    if encoder_count == 0 and decoder_count == 0:
+        raise TestExecutionError("O ZIP deve conter encoder.c, decoder.c ou ambos.")
+    return {"has_encoder": encoder_count == 1, "has_decoder": decoder_count == 1}
+
+
+def resolve_test_mode(zip_path: Path, requested_mode: str = "auto") -> str:
+    """Resolve and validate which test mode ('both', 'encoder_only', 'decoder_only') to run."""
+    sources = inspect_zip_sources(zip_path)
+    has_encoder = sources["has_encoder"]
+    has_decoder = sources["has_decoder"]
+
+    if requested_mode == "auto":
+        if has_encoder and has_decoder:
+            return "both"
+        return "encoder_only" if has_encoder else "decoder_only"
+
+    if requested_mode not in VALID_TEST_MODES:
+        raise TestExecutionError("Modo de teste inválido.")
+    if requested_mode in ("both", "encoder_only") and not has_encoder:
+        raise TestExecutionError("O ZIP enviado não contém o arquivo encoder.c.")
+    if requested_mode in ("both", "decoder_only") and not has_decoder:
+        raise TestExecutionError("O ZIP enviado não contém o arquivo decoder.c.")
+    return requested_mode
+
+
+def validate_test_sources(zip_path: Path, mode: str = "both") -> None:
+    resolve_test_mode(zip_path, mode)
+
 
 def extract_source(zip_path: Path, name: str, destination: Path) -> Path:
+    destination.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as archive:
-        source_info = next(info for info in archive.infolist() if Path(info.filename).name == name)
+        source_info = next(info for info in archive.infolist() if not info.is_dir() and Path(info.filename).name == name)
         source_path = destination / name
         with archive.open(source_info) as source, source_path.open("wb") as target:
             shutil.copyfileobj(source, target)
@@ -158,60 +191,159 @@ def validate_custom_test_input(message: str, p: int, q: int, e: int) -> tuple[in
     return p * q, pow(e, -1, phi)
 
 
-def run_custom_test(zip_path: Path, message: str, p: int, q: int, e: int) -> dict:
-    """Compile an upload and execute one student-selected RSA round trip."""
+def _prepare_student_and_oracle_programs(zip_path: Path, mode: str, root: Path) -> tuple[Path | None, Path | None, str]:
+    """Compile student submission paired with the menu oracle when testing a single side."""
+    if mode in ("both", "encoder_only"):
+        encoder_source = extract_source(zip_path, "encoder.c", root / "enc")
+    else:
+        if not ORACLE_ENCODER_SOURCE.exists():
+            return None, None, "Oráculo encoder.c não encontrado no servidor."
+        encoder_source = ORACLE_ENCODER_SOURCE
+
+    if mode in ("both", "decoder_only"):
+        decoder_source = extract_source(zip_path, "decoder.c", root / "dec")
+    else:
+        if not ORACLE_DECODER_SOURCE.exists():
+            return None, None, "Oráculo decoder.c não encontrado no servidor."
+        decoder_source = ORACLE_DECODER_SOURCE
+
+    encoder = root / "encoder"
+    decoder = root / "decoder"
+    encoder_ok, encoder_log = compile_source(encoder_source, encoder)
+    decoder_ok, decoder_log = compile_source(decoder_source, decoder)
+    if not encoder_ok:
+        label = "oráculo encoder.c" if mode == "decoder_only" else "encoder.c"
+        return None, None, f"Falha de compilação ({label}): {encoder_log}"
+    if not decoder_ok:
+        label = "oráculo decoder.c" if mode == "encoder_only" else "decoder.c"
+        return None, None, f"Falha de compilação ({label}): {decoder_log}"
+    return encoder, decoder, ""
+
+
+def _evaluate_single_case(
+    encoder: Path,
+    decoder: Path,
+    message: str,
+    n: int,
+    e: int,
+    d: int,
+    mode: str = "both",
+) -> dict:
+    """Execute one RSA round trip and return outcome ('approved', 'failed', 'errored') and details."""
+    encrypted, enc_error, _, _ = run_program(
+        encoder,
+        {"message": message, "public_key": {"n": n, "e": e}},
+    )
+    ciphertext = encrypted.get("ciphertext") if isinstance(encrypted, dict) else None
+    if not isinstance(ciphertext, list) or not all(isinstance(value, int) for value in ciphertext):
+        origin = "oráculo encoder" if mode == "decoder_only" else "encoder"
+        return {
+            "outcome": "errored",
+            "ciphertext": [],
+            "decrypted_message": None,
+            "decoder_output": "",
+            "decoder_stderr": "",
+            "error": enc_error or f"Saída do {origin} inválida.",
+        }
+
+    expected = [pow(ord(character), e, n) for character in message]
+    decrypted, dec_error, decoder_output, decoder_stderr = run_program(
+        decoder,
+        {"ciphertext": ciphertext, "private_key": {"n": n, "d": d}},
+    )
+    decrypted_message = decrypted.get("message") if isinstance(decrypted, dict) else None
+
+    if ciphertext != expected:
+        decoder_label = "oráculo decoder" if mode == "encoder_only" else "decoder"
+        if isinstance(decrypted_message, str):
+            diagnostic = f"Texto devolvido pelo {decoder_label}: {preview_message(decrypted_message)!r}."
+        else:
+            diagnostic = f"O {decoder_label} nao devolveu texto legivel: {dec_error or 'saida invalida.'}"
+        return {
+            "outcome": "failed",
+            "ciphertext": ciphertext,
+            "decrypted_message": decrypted_message if isinstance(decrypted_message, str) else None,
+            "decoder_output": decoder_output,
+            "decoder_stderr": decoder_stderr,
+            "error": (
+                "O ciphertext nao corresponde ao RSA esperado. "
+                f"Mensagem de teste: {preview_message(message)!r}. {diagnostic} "
+                f"Saida bruta do decoder: {preview_output(decoder_output)}. "
+                f"Stderr do decoder: {preview_output(decoder_stderr)}"
+            ),
+        }
+
+    if not isinstance(decrypted_message, str):
+        return {
+            "outcome": "errored",
+            "ciphertext": ciphertext,
+            "decrypted_message": None,
+            "decoder_output": decoder_output,
+            "decoder_stderr": decoder_stderr,
+            "error": dec_error or "O decoder nao devolveu uma mensagem valida.",
+        }
+
+    if decrypted_message != message:
+        return {
+            "outcome": "failed",
+            "ciphertext": ciphertext,
+            "decrypted_message": decrypted_message,
+            "decoder_output": decoder_output,
+            "decoder_stderr": decoder_stderr,
+            "error": (
+                "A mensagem nao foi descriptografada corretamente. "
+                f"Esperado: {preview_message(message)!r}. Recebido: {preview_message(decrypted_message)!r}."
+            ),
+        }
+
+    return {
+        "outcome": "approved",
+        "ciphertext": ciphertext,
+        "decrypted_message": decrypted_message,
+        "decoder_output": decoder_output,
+        "decoder_stderr": decoder_stderr,
+        "error": "",
+    }
+
+
+def run_custom_test(
+    zip_path: Path,
+    message: str,
+    p: int,
+    q: int,
+    e: int,
+    mode: str = "auto",
+) -> dict:
+    """Compile an upload (with optional oracle) and execute one student-selected RSA round trip."""
     n, d = validate_custom_test_input(message, p, q, e)
-    validate_test_sources(zip_path)
+    resolved_mode = resolve_test_mode(zip_path, mode)
 
     with tempfile.TemporaryDirectory(prefix="rsa-custom-test-") as directory:
-        root = Path(directory)
-        encoder_source = extract_source(zip_path, "encoder.c", root)
-        decoder_source = extract_source(zip_path, "decoder.c", root)
-        encoder = root / "encoder"
-        decoder = root / "decoder"
-        encoder_ok, encoder_log = compile_source(encoder_source, encoder)
-        decoder_ok, decoder_log = compile_source(decoder_source, decoder)
-        if not encoder_ok or not decoder_ok:
-            log = encoder_log if not encoder_ok else decoder_log
-            return {"status": "error", "ciphertext": [], "decrypted_message": None, "decoder_output": "", "decoder_stderr": "", "error": f"Falha de compilacao: {log}"}
-
-        encrypted, error, _, _ = run_program(
-            encoder,
-            {"message": message, "public_key": {"n": n, "e": e}},
-        )
-        ciphertext = encrypted.get("ciphertext") if isinstance(encrypted, dict) else None
-        if not isinstance(ciphertext, list) or not all(isinstance(value, int) for value in ciphertext):
-            return {"status": "error", "ciphertext": [], "decrypted_message": None, "decoder_output": "", "decoder_stderr": "", "error": error or "Saida do encoder invalida."}
-
-        expected = [pow(ord(character), e, n) for character in message]
-        decrypted, error, decoder_output, decoder_stderr = run_program(
-            decoder,
-            {"ciphertext": ciphertext, "private_key": {"n": n, "d": d}},
-        )
-        decrypted_message = decrypted.get("message") if isinstance(decrypted, dict) else None
-        if ciphertext != expected:
-            decoder_detail = ""
-            if not isinstance(decrypted_message, str):
-                decoder_detail = f" O decoder tambem nao retornou uma mensagem valida: {error or 'saida invalida.'}"
+        encoder, decoder, compile_error = _prepare_student_and_oracle_programs(zip_path, resolved_mode, Path(directory))
+        if compile_error or not encoder or not decoder:
             return {
-                "status": "failed",
-                "ciphertext": ciphertext,
-                "decrypted_message": decrypted_message if isinstance(decrypted_message, str) else None,
-                "decoder_output": decoder_output,
-                "decoder_stderr": decoder_stderr,
-                "error": "O ciphertext nao corresponde ao RSA esperado." + decoder_detail,
-            }
-        if decrypted_message != message:
-            return {
+                "mode": resolved_mode,
+                "oracle_used": {"encoder": resolved_mode == "decoder_only", "decoder": resolved_mode == "encoder_only"},
                 "status": "error",
-                "ciphertext": ciphertext,
-                "decrypted_message": decrypted_message if isinstance(decrypted_message, str) else None,
-                "decoder_output": decoder_output,
-                "decoder_stderr": decoder_stderr,
-                "error": error or "A mensagem nao foi descriptografada corretamente.",
+                "ciphertext": [],
+                "decrypted_message": None,
+                "decoder_output": "",
+                "decoder_stderr": "",
+                "error": compile_error,
             }
 
-    return {"status": "passed", "ciphertext": ciphertext, "decrypted_message": decrypted_message, "decoder_output": decoder_output, "decoder_stderr": decoder_stderr, "error": ""}
+        case_result = _evaluate_single_case(encoder, decoder, message, n, e, d, mode=resolved_mode)
+        status_map = {"approved": "passed", "failed": "failed", "errored": "error"}
+        return {
+            "mode": resolved_mode,
+            "oracle_used": {"encoder": resolved_mode == "decoder_only", "decoder": resolved_mode == "encoder_only"},
+            "status": status_map[case_result["outcome"]],
+            "ciphertext": case_result["ciphertext"],
+            "decrypted_message": case_result["decrypted_message"],
+            "decoder_output": case_result["decoder_output"],
+            "decoder_stderr": case_result["decoder_stderr"],
+            "error": case_result["error"],
+        }
 
 
 TEST_MESSAGES: tuple[str, ...] = (
@@ -278,78 +410,47 @@ def test_cases() -> list[TestCase]:
     return cases
 
 
-def run_test_battery(zip_path: Path) -> dict:
-    """Compile both files and return the 240-case aggregate result."""
-    validate_test_sources(zip_path)
+def run_test_battery(zip_path: Path, mode: str = "auto") -> dict:
+    """Compile student files (paired with menu oracle if partial) and run the 240-case battery."""
+    resolved_mode = resolve_test_mode(zip_path, mode)
     buckets = {str(digit): {"total": 0, "approved": 0, "failed": 0, "errored": 0} for digit in PRIME_DIGITS}
     approved = failed = errored = 0
     last_error = ""
 
     with tempfile.TemporaryDirectory(prefix="rsa-test-") as directory:
-        root = Path(directory)
-        encoder_source = extract_source(zip_path, "encoder.c", root)
-        decoder_source = extract_source(zip_path, "decoder.c", root)
-        encoder = root / "encoder"
-        decoder = root / "decoder"
-        encoder_ok, encoder_log = compile_source(encoder_source, encoder)
-        decoder_ok, decoder_log = compile_source(decoder_source, decoder)
-        if not encoder_ok or not decoder_ok:
-            message = encoder_log if not encoder_ok else decoder_log
+        encoder, decoder, compile_error = _prepare_student_and_oracle_programs(zip_path, resolved_mode, Path(directory))
+        if compile_error or not encoder or not decoder:
             for bucket in buckets.values():
                 bucket["total"] = 30
                 bucket["errored"] = 30
             return {
-                "total": TOTAL_TESTS, "approved": 0, "failed": 0, "errored": TOTAL_TESTS,
-                "buckets": buckets, "last_error": f"Falha de compilação: {message}",
+                "mode": resolved_mode,
+                "total": TOTAL_TESTS,
+                "approved": 0,
+                "failed": 0,
+                "errored": TOTAL_TESTS,
+                "buckets": buckets,
+                "last_error": compile_error,
             }
 
         for case in test_cases():
             bucket = buckets[str(case.prime_digits)]
             bucket["total"] += 1
-            encrypted, error, _, _ = run_program(
-                encoder,
-                {"message": case.message, "public_key": {"n": case.n, "e": case.e}},
-            )
-            result = "approved"
-            if not isinstance(encrypted, dict) or not isinstance(encrypted.get("ciphertext"), list):
-                result, last_error = "errored", error or "Saída do encoder inválida."
-            else:
-                ciphertext = encrypted["ciphertext"]
-                expected = [pow(ord(character), case.e, case.n) for character in case.message]
-                if ciphertext != expected:
-                    decrypted, error, decoder_output, decoder_stderr = run_program(
-                        decoder,
-                        {"ciphertext": ciphertext, "private_key": {"n": case.n, "d": case.d}},
-                    )
-                    decrypted_message = decrypted.get("message") if isinstance(decrypted, dict) else None
-                    if isinstance(decrypted_message, str):
-                        diagnostic = f"Texto devolvido pelo decoder: {preview_message(decrypted_message)!r}."
-                    else:
-                        diagnostic = f"O decoder nao devolveu texto legivel: {error or 'saida invalida.'}"
-                    result, last_error = (
-                        "failed",
-                        "O ciphertext nao corresponde ao RSA esperado. "
-                        f"Mensagem de teste: {preview_message(case.message)!r}. {diagnostic} "
-                        f"Saida bruta do decoder: {preview_output(decoder_output)}. "
-                        f"Stderr do decoder: {preview_output(decoder_stderr)}",
-                    )
-                else:
-                    decrypted, error, _, _ = run_program(
-                        decoder,
-                        {"ciphertext": ciphertext, "private_key": {"n": case.n, "d": case.d}},
-                    )
-                    if not isinstance(decrypted, dict) or decrypted.get("message") != case.message:
-                        result, last_error = "errored", error or "A mensagem não foi descriptografada corretamente."
+            case_result = _evaluate_single_case(encoder, decoder, case.message, case.n, case.e, case.d, mode=resolved_mode)
+            outcome = case_result["outcome"]
+            if outcome != "approved":
+                last_error = case_result["error"]
 
-            bucket[{"approved": "approved", "failed": "failed", "errored": "errored"}[result]] += 1
-            if result == "approved":
+            bucket[outcome] += 1
+            if outcome == "approved":
                 approved += 1
-            elif result == "failed":
+            elif outcome == "failed":
                 failed += 1
             else:
                 errored += 1
 
     return {
+        "mode": resolved_mode,
         "total": TOTAL_TESTS,
         "approved": approved,
         "failed": failed,
@@ -426,79 +527,277 @@ def group_test_cases() -> list[TestCase]:
     return cases
 
 
-def _compile_cross_programs(encoder_zip_path: Path, decoder_zip_path: Path, root: Path) -> tuple[Path | None, Path | None, str]:
-    validate_test_sources(encoder_zip_path)
-    validate_test_sources(decoder_zip_path)
-    encoder_source = extract_source(encoder_zip_path, "encoder.c", root)
-    decoder_source = extract_source(decoder_zip_path, "decoder.c", root)
-    encoder = root / "encoder"
-    decoder = root / "decoder"
-    encoder_ok, encoder_log = compile_source(encoder_source, encoder)
-    decoder_ok, decoder_log = compile_source(decoder_source, decoder)
-    if not encoder_ok or not decoder_ok:
-        failed_program = "encoder" if not encoder_ok else "decoder"
-        log = encoder_log if not encoder_ok else decoder_log
-        return None, None, f"Falha de compilacao do {failed_program}: {log}"
-    return encoder, decoder, ""
+def _compile_cross_programs(
+    encoder_zip_path: Path,
+    decoder_zip_path: Path,
+    root: Path,
+) -> tuple[Path | None, Path | None, str, str]:
+    """Validate and compile each group's assigned role independently."""
+    encoder: Path | None = None
+    decoder: Path | None = None
+    encoder_error = ""
+    decoder_error = ""
+
+    try:
+        validate_test_sources(encoder_zip_path, "encoder_only")
+        encoder_source = extract_source(encoder_zip_path, "encoder.c", root / "enc")
+        encoder_bin = root / "encoder"
+        encoder_ok, encoder_log = compile_source(encoder_source, encoder_bin)
+        if encoder_ok:
+            encoder = encoder_bin
+        else:
+            encoder_error = f"Falha de compilação do encoder: {encoder_log}"
+    except TestExecutionError as exc:
+        encoder_error = str(exc)
+
+    try:
+        validate_test_sources(decoder_zip_path, "decoder_only")
+        decoder_source = extract_source(decoder_zip_path, "decoder.c", root / "dec")
+        decoder_bin = root / "decoder"
+        decoder_ok, decoder_log = compile_source(decoder_source, decoder_bin)
+        if decoder_ok:
+            decoder = decoder_bin
+        else:
+            decoder_error = f"Falha de compilação do decoder: {decoder_log}"
+    except TestExecutionError as exc:
+        decoder_error = str(exc)
+
+    return encoder, decoder, encoder_error, decoder_error
+
+
+def _evaluate_cross_case(
+    encoder: Path | None,
+    decoder: Path | None,
+    message: str,
+    n: int,
+    e: int,
+    d: int,
+    prime_digits: int,
+    encoder_compile_error: str = "",
+    decoder_compile_error: str = "",
+) -> dict:
+    """Evaluate both groups independently and together so blame is always unambiguous."""
+    expected = [pow(ord(character), e, n) for character in message]
+
+    ciphertext: list[int] = []
+    if encoder is None:
+        encoder_status = "error"
+        encoder_error = encoder_compile_error
+    else:
+        encrypted, enc_raw_err, _, _ = run_program(encoder, {"message": message, "public_key": {"n": n, "e": e}})
+        raw_ct = encrypted.get("ciphertext") if isinstance(encrypted, dict) else None
+        if not isinstance(raw_ct, list) or not all(isinstance(value, int) for value in raw_ct):
+            encoder_status = "error"
+            encoder_error = enc_raw_err or f"Saida do encoder invalida ({prime_digits} digitos)."
+        elif raw_ct != expected:
+            encoder_status = "failed"
+            ciphertext = raw_ct
+            encoder_error = (
+                f"O ciphertext do grupo encoder nao corresponde ao RSA esperado ({prime_digits} digitos). "
+                f"Mensagem: {preview_message(message)!r}."
+            )
+        else:
+            encoder_status = "passed"
+            ciphertext = raw_ct
+            encoder_error = ""
+
+    # When encoder fails, pass the expected RSA ciphertext to the decoder so we isolate whether the decoder group works.
+    decoder_input = ciphertext if encoder_status == "passed" else expected
+    if decoder is None:
+        decoder_status = "error"
+        decoder_error = decoder_compile_error
+        decrypted_message = None
+        decoder_output = ""
+        decoder_stderr = ""
+    else:
+        decrypted, dec_raw_err, decoder_output, decoder_stderr = run_program(
+            decoder,
+            {"ciphertext": decoder_input, "private_key": {"n": n, "d": d}},
+        )
+        decrypted_message = decrypted.get("message") if isinstance(decrypted, dict) else None
+        if not isinstance(decrypted_message, str):
+            decoder_status = "error"
+            decoder_error = (
+                dec_raw_err
+                or f"Saida do decoder invalida ({prime_digits} digitos). Stdout: {preview_output(decoder_output)}. Stderr: {preview_output(decoder_stderr)}"
+            )
+            decrypted_message = None
+        elif decrypted_message != message:
+            decoder_status = "failed"
+            decoder_error = (
+                f"O decoder nao recuperou a mensagem original ({prime_digits} digitos). "
+                f"Esperado: {preview_message(message)!r}. Recebido: {preview_message(decrypted_message)!r}."
+            )
+        else:
+            decoder_status = "passed"
+            decoder_error = ""
+
+    if encoder_status == "passed" and decoder_status == "passed":
+        overall = "approved"
+    elif encoder_status == "error" or decoder_status == "error":
+        overall = "errored"
+    else:
+        overall = "failed"
+
+    return {
+        "overall": overall,
+        "encoder_status": encoder_status,
+        "decoder_status": decoder_status,
+        "encoder_error": encoder_error,
+        "decoder_error": decoder_error,
+        "ciphertext": ciphertext,
+        "decrypted_message": decrypted_message,
+        "decoder_output": decoder_output,
+        "decoder_stderr": decoder_stderr,
+    }
+
+
+def _determine_faulty_side(encoder_has_issue: bool, decoder_has_issue: bool) -> str:
+    if encoder_has_issue and decoder_has_issue:
+        return "both"
+    if encoder_has_issue:
+        return "encoder"
+    if decoder_has_issue:
+        return "decoder"
+    return "none"
+
+
+def _compose_cross_error(faulty_side: str, encoder_error: str, decoder_error: str) -> str:
+    if faulty_side == "both":
+        return f"Falha em ambos os grupos. Encoder: {encoder_error} | Decoder: {decoder_error}"
+    if faulty_side == "encoder":
+        return f"Falha no grupo Encoder: {encoder_error}"
+    if faulty_side == "decoder":
+        return f"Falha no grupo Decoder: {decoder_error}"
+    return ""
 
 
 def run_group_test_battery(encoder_zip_path: Path, decoder_zip_path: Path) -> dict:
-    """Run 400 interoperability cases: 50 messages for each prime size from 2 to 9 digits."""
+    """Run 400 interoperability cases and identify clearly which group (encoder/decoder/both) failed."""
     approved = failed = errored = 0
-    last_error = ""
+    enc_approved = enc_failed = enc_errored = 0
+    dec_approved = dec_failed = dec_errored = 0
+    enc_last_error = ""
+    dec_last_error = ""
+
     with tempfile.TemporaryDirectory(prefix="rsa-group-test-") as directory:
-        encoder, decoder, compile_error = _compile_cross_programs(encoder_zip_path, decoder_zip_path, Path(directory))
-        if compile_error:
-            return {"total": GROUP_TOTAL_TESTS, "approved": 0, "failed": 0, "errored": GROUP_TOTAL_TESTS, "last_error": compile_error}
+        encoder, decoder, enc_compile_err, dec_compile_err = _compile_cross_programs(
+            encoder_zip_path, decoder_zip_path, Path(directory)
+        )
+        if encoder is None and decoder is None:
+            return {
+                "total": GROUP_TOTAL_TESTS,
+                "approved": 0,
+                "failed": 0,
+                "errored": GROUP_TOTAL_TESTS,
+                "faulty_side": "both",
+                "encoder_stats": {"approved": 0, "failed": 0, "errored": GROUP_TOTAL_TESTS, "last_error": enc_compile_err},
+                "decoder_stats": {"approved": 0, "failed": 0, "errored": GROUP_TOTAL_TESTS, "last_error": dec_compile_err},
+                "last_error": _compose_cross_error("both", enc_compile_err, dec_compile_err),
+            }
 
         for case in group_test_cases():
-            encrypted, encoder_error, _, _ = run_program(encoder, {"message": case.message, "public_key": {"n": case.n, "e": case.e}})
-            ciphertext = encrypted.get("ciphertext") if isinstance(encrypted, dict) else None
-            if not isinstance(ciphertext, list) or not all(isinstance(value, int) for value in ciphertext):
-                errored += 1
-                last_error = encoder_error or "Saida do encoder invalida."
-                continue
+            res = _evaluate_cross_case(
+                encoder,
+                decoder,
+                case.message,
+                case.n,
+                case.e,
+                case.d,
+                case.prime_digits,
+                enc_compile_err,
+                dec_compile_err,
+            )
 
-            decrypted, decoder_error, decoder_output, decoder_stderr = run_program(decoder, {"ciphertext": ciphertext, "private_key": {"n": case.n, "d": case.d}})
-            decrypted_message = decrypted.get("message") if isinstance(decrypted, dict) else None
-            expected = [pow(ord(character), case.e, case.n) for character in case.message]
-            if ciphertext != expected:
+            if res["encoder_status"] == "passed":
+                enc_approved += 1
+            elif res["encoder_status"] == "failed":
+                enc_failed += 1
+                enc_last_error = res["encoder_error"]
+            else:
+                enc_errored += 1
+                enc_last_error = res["encoder_error"]
+
+            if res["decoder_status"] == "passed":
+                dec_approved += 1
+            elif res["decoder_status"] == "failed":
+                dec_failed += 1
+                dec_last_error = res["decoder_error"]
+            else:
+                dec_errored += 1
+                dec_last_error = res["decoder_error"]
+
+            if res["overall"] == "approved":
+                approved += 1
+            elif res["overall"] == "failed":
                 failed += 1
-                last_error = (
-                    "O ciphertext do grupo encoder nao corresponde ao RSA esperado. "
-                    f"Mensagem de teste: {preview_message(case.message)!r}. "
-                    f"Texto devolvido pelo decoder: {preview_message(decrypted_message)!r} "
-                    if isinstance(decrypted_message, str) else
-                    "O ciphertext do grupo encoder nao corresponde ao RSA esperado. "
-                    f"O decoder nao devolveu texto legivel: {decoder_error or 'saida invalida.'}. "
-                    f"Saida bruta do decoder: {preview_output(decoder_output)}. Stderr do decoder: {preview_output(decoder_stderr)}"
-                )
-                continue
-            if decrypted_message != case.message:
+            else:
                 errored += 1
-                last_error = decoder_error or "O decoder nao recuperou a mensagem original."
-                continue
-            approved += 1
 
-    return {"total": GROUP_TOTAL_TESTS, "approved": approved, "failed": failed, "errored": errored, "last_error": last_error}
+    faulty_side = _determine_faulty_side(
+        (enc_failed + enc_errored) > 0,
+        (dec_failed + dec_errored) > 0,
+    )
+    last_error = _compose_cross_error(faulty_side, enc_last_error, dec_last_error)
+
+    return {
+        "total": GROUP_TOTAL_TESTS,
+        "approved": approved,
+        "failed": failed,
+        "errored": errored,
+        "faulty_side": faulty_side,
+        "encoder_stats": {
+            "approved": enc_approved,
+            "failed": enc_failed,
+            "errored": enc_errored,
+            "last_error": enc_last_error,
+        },
+        "decoder_stats": {
+            "approved": dec_approved,
+            "failed": dec_failed,
+            "errored": dec_errored,
+            "last_error": dec_last_error,
+        },
+        "last_error": last_error,
+    }
 
 
 def run_group_custom_test(encoder_zip_path: Path, decoder_zip_path: Path, message: str, p: int, q: int, e: int) -> dict:
     """Run one teacher-configured interoperability test between two group uploads."""
     n, d = validate_custom_test_input(message, p, q, e)
     with tempfile.TemporaryDirectory(prefix="rsa-group-custom-test-") as directory:
-        encoder, decoder, compile_error = _compile_cross_programs(encoder_zip_path, decoder_zip_path, Path(directory))
-        if compile_error:
-            return {"status": "error", "ciphertext": [], "decrypted_message": None, "decoder_output": "", "decoder_stderr": "", "error": compile_error}
-        encrypted, error, _, _ = run_program(encoder, {"message": message, "public_key": {"n": n, "e": e}})
-        ciphertext = encrypted.get("ciphertext") if isinstance(encrypted, dict) else None
-        if not isinstance(ciphertext, list) or not all(isinstance(value, int) for value in ciphertext):
-            return {"status": "error", "ciphertext": [], "decrypted_message": None, "decoder_output": "", "decoder_stderr": "", "error": error or "Saida do encoder invalida."}
-        decrypted, error, decoder_output, decoder_stderr = run_program(decoder, {"ciphertext": ciphertext, "private_key": {"n": n, "d": d}})
-        decrypted_message = decrypted.get("message") if isinstance(decrypted, dict) else None
-        expected = [pow(ord(character), e, n) for character in message]
-        if ciphertext != expected:
-            return {"status": "failed", "ciphertext": ciphertext, "decrypted_message": decrypted_message if isinstance(decrypted_message, str) else None, "decoder_output": decoder_output, "decoder_stderr": decoder_stderr, "error": "O ciphertext nao corresponde ao RSA esperado."}
-        if decrypted_message != message:
-            return {"status": "error", "ciphertext": ciphertext, "decrypted_message": decrypted_message if isinstance(decrypted_message, str) else None, "decoder_output": decoder_output, "decoder_stderr": decoder_stderr, "error": error or "O decoder nao recuperou a mensagem original."}
-    return {"status": "passed", "ciphertext": ciphertext, "decrypted_message": decrypted_message, "decoder_output": decoder_output, "decoder_stderr": decoder_stderr, "error": ""}
+        encoder, decoder, enc_compile_err, dec_compile_err = _compile_cross_programs(
+            encoder_zip_path, decoder_zip_path, Path(directory)
+        )
+        res = _evaluate_cross_case(
+            encoder,
+            decoder,
+            message,
+            n,
+            e,
+            d,
+            len(str(p)),
+            enc_compile_err,
+            dec_compile_err,
+        )
+
+    faulty_side = _determine_faulty_side(
+        res["encoder_status"] != "passed",
+        res["decoder_status"] != "passed",
+    )
+    status_map = {"approved": "passed", "failed": "failed", "errored": "error"}
+    combined_error = _compose_cross_error(faulty_side, res["encoder_error"], res["decoder_error"])
+
+    return {
+        "status": status_map[res["overall"]],
+        "faulty_side": faulty_side,
+        "encoder_status": res["encoder_status"],
+        "decoder_status": res["decoder_status"],
+        "encoder_error": res["encoder_error"],
+        "decoder_error": res["decoder_error"],
+        "ciphertext": res["ciphertext"],
+        "decrypted_message": res["decrypted_message"],
+        "decoder_output": res["decoder_output"],
+        "decoder_stderr": res["decoder_stderr"],
+        "error": combined_error,
+    }
